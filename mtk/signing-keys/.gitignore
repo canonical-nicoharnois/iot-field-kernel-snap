@@ -1,0 +1,4 @@
+# Never commit signing material. Only this file and the README belong in git.
+*
+!.gitignore
+!README.md

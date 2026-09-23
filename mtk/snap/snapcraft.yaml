@@ -1,0 +1,377 @@
+name: mediatek-genio-kernel
+type: kernel
+build-base: core24
+adopt-info: kernel
+summary: The MediaTek Genio family Linux kernel
+description: |
+  This snap provides the kernel, modules, firmware, and initrd required to
+  create an Ubuntu Core 24 image for the MediaTek Genio family (Genio 350,
+  510/520, 700, 720 and 1200 EVKs).
+
+  The kernel and initrd are provided as a single unified kernel image which is
+  booted through the EBBR flow of the board: BL2 and BL31 (TF-A) hand over to
+  OP-TEE and then to U-Boot, which locates the EFI loader on the ESP.
+
+  The unified kernel image is signed, and the certificate of the key that signed
+  it is shipped as uefi.crt so that it can be enrolled in the board's firmware.
+  By default that key is generated during the build and thrown away; put a key
+  pair in the signing-keys/ directory next to this recipe to sign with your own.
+  The board only enforces the signature if U-Boot is built with EFI secure boot
+  and the certificate is in its variable store.
+
+  Full disk encryption is supported through the OP-TEE FDE hooks: the fde-setup
+  hook seals the disk keys in the secure world at install time and the
+  fde-reveal-key inside the initrd unseals them at every boot. This requires the
+  fde_key_handler trusted application to be part of the OP-TEE firmware flashed
+  on the board, which is the case on the Genio EVKs running MediaTek's Ubuntu
+  Core firmware.
+  # TODO: FDE hook to be removed, it is now handled by the snapd implementation
+
+  The MediaTek device trees are shipped under dtbs/: the base board trees plus
+  the overlays that come with them (camera, display, audio, APU). Note that 
+  these are not what the board boots with. U-Boot takes the device tree from
+  the firmware partition and passes it to the EFI loader, so they serve as 
+  the reference copy for the gadget and for runtime overlay tooling. 
+
+  This snapcraft.yaml is licensed under CC-BY-SA-4.0
+
+  Where the contents come from:
+
+  kernel:             https://git.launchpad.net/~canonical-kernel/ubuntu/+source/linux-mtk/+git/noble
+  linux-firmware:     https://git.launchpad.net/ubuntu/+source/linux-firmware/tree/?h=applied/ubuntu/noble
+  genio firmware:     https://git.launchpad.net/ubuntu/+source/linux-firmware-mediatek-genio
+
+grade: stable
+# Change to devmode to make FDE hook able to access tee if the snap is not
+# published on the store, with interface auto-connected
+confinement: strict
+
+license: "GPL-2.0 AND GPL-3.0 AND CC-BY-SA-4.0"
+
+platforms:
+  arm64:
+    build-on: [amd64, arm64]
+    build-for: [arm64]
+
+# Needed to fetch arm64 packages when cross-building on amd64.
+package-repositories:
+  - type: apt
+    architectures: [$CRAFT_ARCH_BUILD_FOR]
+    formats: [deb]
+    components: [main]
+    suites: [noble, noble-updates, noble-security]
+    key-id: F6ECB3762474EDA9D21B7022871920D1991BC93C
+    url: http://ports.ubuntu.com/ubuntu-ports
+  # Add temporarily baoshan-release public PPA for linux-firmware-mediatek-genio
+  # Waiting for Mali firmware availability in noble archive (multiverse)
+  - type: apt
+    architectures: [$CRAFT_ARCH_BUILD_FOR]
+    formats: [deb]
+    components: [main]
+    suites: [noble]
+    key-id: CB4586AF5C6BCD8DF3D48B6856DDEA4936C799E5
+    url: https://ppa.launchpadcontent.net/baoshan-team/baoshan-release/ubuntu
+
+# The FDE helper is linked against libteec and libjson-c, which this snap ships
+# in usr/lib and which are nowhere on the library search path of the base snap.
+environment:
+  LD_LIBRARY_PATH: ${SNAP}/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}
+
+# The hook talks to the secure world through /dev/tee0, which is what the tee
+# plug is for.
+hooks:
+  fde-setup:
+    plugs: [tee, home]
+
+parts:
+  # Provide the kernel.
+  #
+  # The source is Canonical's public linux-mtk noble tree.
+  kernel:
+    plugin: kernel
+    source: https://git.launchpad.net/~canonical-kernel/ubuntu/+source/linux-mtk/+git/noble
+    source-type: git
+    source-branch: main-next
+    source-depth: 1
+    # Build the config of the 'mtk' flavour out of debian.mtk/config/annotations,
+    # the same config the linux-mtk debs are built with. The plugin does this by
+    # running 'debian/rules clean genconfigs' in the source tree.
+    kernel-ubuntu-kconfigflavour: mtk
+    kernel-kconfigs:
+      # Debug info roughly triples the size of the build tree and adds a lot of
+      # build time. Nothing in the snap ships it, so drop it. Remove this line
+      # if you need to build out-of-tree modules with matching debug info.
+      - CONFIG_DEBUG_INFO_NONE=y
+    build-packages:
+      - on amd64:
+          - crossbuild-essential-arm64
+    override-build: |
+      craftctl default
+
+      # Set the snap version to the kernel package version
+      version="$(sed -n '1s/.*(\(.*\)).*/\1/p' \
+        "${CRAFT_PART_SRC}/debian.mtk/changelog")"
+      [ -n "${version}" ] || {
+        echo "could not read the version from debian.mtk/changelog" >&2
+        exit 1
+      }
+      craftctl set version="${version}"
+
+      # The kernel's own license, for the image and the modules built here.
+      install -Dm 644 "${CRAFT_PART_SRC}/COPYING" \
+        "${CRAFT_PART_INSTALL}/licenses/COPYING.linux"
+      cp -a "${CRAFT_PART_SRC}/LICENSES" \
+        "${CRAFT_PART_INSTALL}/licenses/LICENSES.linux"
+    # Everything is staged so the initrd part can pick up vmlinuz-* and
+    # modules/, but the kernel image itself is not shipped as such: it ends up
+    # inside the UKI.
+    # Of the device trees the build produces for every arm64 vendor, only the
+    # MediaTek ones are shipped.
+    prime:
+      - lib/
+      - modules/
+      - dtbs/mediatek/
+      - licenses/
+      - System.map-*
+      - config-*
+
+  # Provide the initrd for Ubuntu Core, packed together with the kernel image
+  # into a signed unified kernel image.
+  #
+  # The initrd includes important things such as snap-bootstrap which
+  # orchestrates the entire Ubuntu Core installation process. The documentation
+  # for this tool can be found here:
+  # https://github.com/snapcore/snapd/blob/master/cmd/snap-bootstrap/README.md
+  #
+  # The mtk flavour builds the Genio storage and USB drivers (MMC_MTK,
+  # SCSI_UFS_MEDIATEK, USB_XHCI_MTK) plus vfat, ext4 and squashfs into the
+  # kernel, so the only module the initrd has to carry is the vfat charset one.
+  initrd:
+    after: [firmware, genio-firmware, kernel, signing, optee-uc-fde-client]
+    plugin: initrd
+    initrd-build-efi-image: true
+    initrd-efi-image-key: uki.key
+    initrd-efi-image-cert: uki.pem
+    initrd-modules:
+      # Unlocking ubuntu-data. dm-crypt is what actually maps the encrypted
+      # volume, and algif_skcipher is the userspace crypto interface
+      # cryptsetup uses
+      - dm-crypt
+      - algif_skcipher
+      # vfat mounts of the ESP name this charset
+      - nls_iso8859-1
+    initrd-addons:
+      - usr/bin/fde-reveal-key
+      - usr/bin/fde-setup
+      - usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}/libteec.so*
+    override-prime: |
+      craftctl default
+      # snapd looks for kernel.efi on grub-managed systems and kernel.img on
+      # u-boot-managed ones.
+      mv "${CRAFT_PRIME}/kernel.efi" "${CRAFT_PRIME}/kernel.img"
+    prime:
+      - kernel.efi
+      - snapd-info
+      - manifest-initramfs.yaml*
+
+  # Ship only the firmware the built modules actually ask for. linux-firmware is
+  # well over a gigabyte; trim-firmware (from Canonical's kernel snap helpers)
+  # keeps the blobs referenced by the modules primed above.
+  firmware:
+    after: [kernel]
+    plugin: dump
+    source: https://git.launchpad.net/canonical-kernel-snaps
+    source-depth: 1
+    source-type: git
+    stage-packages:
+      - linux-firmware
+      - wireless-regdb
+    organize:
+      # On Ubuntu Core, the firmware directory is expected to be at the
+      # top-level. However, the kernel assumes firmware is in lib/firmware/. The
+      # kernel plugin will create the appropriate symlink for us.
+      lib/firmware: firmware/
+    override-build: |
+      craftctl default
+
+      # A license file for every package unpacked above, named after it.
+      # DEP-5 copyright files are self-contained: they list which blobs each
+      # license applies to and include the full text of each one, so this covers
+      # linux-firmware and wireless-regdb in one rule.
+      found=""
+      for doc in "${CRAFT_PART_INSTALL}"/usr/share/doc/*/copyright; do
+        [ -f "${doc}" ] || continue
+        pkg="$(basename "$(dirname "${doc}")")"
+        install -Dm 644 "${doc}" \
+          "${CRAFT_PART_INSTALL}/licenses/copyright.${pkg}"
+        found=y
+      done
+      [ -n "${found}" ] || {
+        echo "no copyright files under usr/share/doc: the firmware packages" \
+             "have moved, and this snap must not ship their blobs without" \
+             "their license texts" >&2
+        exit 1
+      }
+
+    override-prime: |
+      craftctl default
+
+      "${CRAFT_STAGE}/trim-firmware" "${CRAFT_PRIME}"
+
+      # trim-firmware keeps only the firmware declared in module metadata. The
+      # MediaTek co-processor firmware and the SOF audio files are declared by no
+      # module, so put them back after the trim -- from this part's own install
+      # directory, which now holds only linux-firmware and wireless-regdb.
+      mkdir -p "${CRAFT_PRIME}/firmware/mediatek"
+      for fw in "${CRAFT_PART_INSTALL}"/firmware/mediatek/mt8* \
+                "${CRAFT_PART_INSTALL}"/firmware/mediatek/sof \
+                "${CRAFT_PART_INSTALL}"/firmware/mediatek/sof-tplg; do
+        [ -d "${fw}" ] || continue
+        cp -a "${fw}" "${CRAFT_PRIME}/firmware/mediatek/"
+      done
+
+      # Create a mountpoint for firmware updates (LP: #2051144)
+      install -d "${CRAFT_PRIME}/firmware/updates"
+    stage:
+      - firmware/
+      - licenses/
+      - trim-firmware
+    prime:
+      - firmware/
+      - licenses/
+
+  # Split as we don't want to trim this one
+  genio-firmware:
+    after: [firmware]
+    plugin: nil
+    stage-packages:
+      - linux-firmware-mediatek-genio:${CRAFT_ARCH_BUILD_FOR}
+    organize:
+      lib/firmware: firmware/
+    override-build: |
+      craftctl default
+      # Same rule as the firmware part: no blobs without their license text.
+      doc="${CRAFT_PART_INSTALL}/usr/share/doc/linux-firmware-mediatek-genio/copyright"
+      [ -f "${doc}" ] || {
+        echo "no copyright at ${doc}: this snap must not ship the Genio" \
+             "firmware without its license text" >&2
+        exit 1
+      }
+      install -Dm 644 "${doc}" \
+        "${CRAFT_PART_INSTALL}/licenses/copyright.linux-firmware-mediatek-genio"
+    stage:
+      - firmware/
+      - licenses/
+    prime:
+      - firmware/
+      - licenses/
+
+  optee-client:
+    plugin: nil
+    source: https://github.com/OP-TEE/optee_client.git
+    source-type: git
+    source-tag: 4.2.0
+    build-packages:
+      - pkgconf:${CRAFT_ARCH_BUILD_FOR}
+      - uuid-dev:${CRAFT_ARCH_BUILD_FOR}
+    build-environment:
+      - to arm64:
+        - ARCH: "${CRAFT_ARCH_BUILD_FOR}"
+      - CROSS_COMPILE: "${CRAFT_ARCH_TRIPLET_BUILD_FOR}-"
+      - DEBUG: "0"
+      - CFG_TEE_CLIENT_LOAD_PATH: ""
+      - CFG_TA_TEST_PATH: "0"
+      - SBINDIR: "/usr/sbin"
+      - LIBDIR: "/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}"
+      - DESTDIR: "${CRAFT_PART_INSTALL}"
+    override-build: |
+      make O=${CRAFT_PART_BUILD}/out -j$(nproc)
+      make install O=${CRAFT_PART_BUILD}/out
+  
+      mkdir -p "${CRAFT_PART_INSTALL}/addons/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}"
+  
+      cp -f "${CRAFT_PART_INSTALL}/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}/libteec"* \
+            "${CRAFT_PART_INSTALL}/addons/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}"
+    prime:
+      - usr/lib/*/lib*so*
+  
+  optee-uc-fde:
+    plugin: dump
+    source: https://github.com/canonical/optee-uc-fde
+    source-type: git
+    source-branch: master
+    organize:
+      "*": optee-uc-fde/
+    prime:
+      - -*
+  
+  optee-uc-fde-client:
+    after:
+      - optee-client
+      - optee-uc-fde
+    plugin: nil
+    source-type: local
+    build-packages:
+      - libjson-c-dev:${CRAFT_ARCH_BUILD_FOR}
+      - libcryptsetup-dev:${CRAFT_ARCH_BUILD_FOR}
+    build-environment:
+      - ARCH: "${CRAFT_ARCH_BUILD_FOR}"
+      - CROSS_COMPILE: "${CRAFT_ARCH_TRIPLET_BUILD_FOR}-"
+      - OPTEE_CLIENT_EXPORT: "${CRAFT_STAGE}/usr"
+      - DESTDIR: "${CRAFT_PART_INSTALL}"
+    override-build: |
+      make -C ${CRAFT_STAGE}/optee-uc-fde O=${CRAFT_PART_BUILD}/out fde-key-manager fde-reveal-key fde-setup
+      make -C ${CRAFT_STAGE}/optee-uc-fde O=${CRAFT_PART_BUILD}/out fde-key-manager fde-reveal-key fde-setup install
+      install -D -m 755 "${CRAFT_PART_INSTALL}/usr/bin/fde-setup" "${CRAFT_PART_INSTALL}/meta/hooks/fde-setup"
+      install -D -m 755 "${CRAFT_PART_INSTALL}/usr/bin/fde-reveal-key" "${CRAFT_PART_INSTALL}/addons/usr/bin/fde-reveal-key"
+      ln -sf fde-reveal-key "${CRAFT_PART_INSTALL}/addons/usr/bin/fde-setup"
+    stage:
+      - addons/
+      - meta/
+    prime:
+      - meta/
+
+  # Key and certificate for signing the UKI
+  signing:
+    plugin: nil
+    source: signing-keys/
+    build-packages:
+      - openssl
+    override-build: |
+      install -d "${CRAFT_PART_INSTALL}/signing"
+
+      # The pair is taken from the signing-keys directory next to this recipe if it
+      # is there, and generated on the spot if it is not, so that a fresh clone
+      # builds without any setup. See signing-keys/README.md for how to generate one,
+      # and for what else has to happen before a board actually verifies the
+      # signature.
+      if [ -r "${CRAFT_PART_SRC}/uki.key" ] && [ -r "${CRAFT_PART_SRC}/uki.pem" ]; then
+        echo "Signing the UKI with signing-keys/uki.key"
+        install -m 600 "${CRAFT_PART_SRC}/uki.key" "${CRAFT_PART_INSTALL}/signing/uki.key"
+        install -m 644 "${CRAFT_PART_SRC}/uki.pem" "${CRAFT_PART_INSTALL}/signing/uki.pem"
+      else
+        echo "*****************************************************************"
+        echo "* No uki.key/uki.pem in signing-keys/."
+        echo "* Generating a throwaway pair: the UKI will be signed, but by a"
+        echo "* key that exists only for this build and that no firmware can be"
+        echo "* told to trust. See signing-keys/README.md."
+        echo "*****************************************************************"
+        openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 7300 \
+          -keyout "${CRAFT_PART_INSTALL}/signing/uki.key" \
+          -out "${CRAFT_PART_INSTALL}/signing/uki.pem" \
+          -subj "/CN=mtk-kernel throwaway UKI signing key/"
+        chmod 600 "${CRAFT_PART_INSTALL}/signing/uki.key"
+      fi
+
+      install -m 644 "${CRAFT_PART_INSTALL}/signing/uki.pem" \
+        "${CRAFT_PART_INSTALL}/uefi.crt"
+
+    # The private key is staged, because the initrd plugin reads it from
+    # ${CRAFT_STAGE}/signing, but it is not primed. Only the certificate is, as
+    # uefi.crt, matching what the kernel team's snap ships.
+    stage:
+      - signing/
+      - uefi.crt
+    prime:
+      - uefi.crt
+
