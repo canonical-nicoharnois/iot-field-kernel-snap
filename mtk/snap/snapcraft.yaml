@@ -19,13 +19,12 @@ description: |
   The board only enforces the signature if U-Boot is built with EFI secure boot
   and the certificate is in its variable store.
 
-  Full disk encryption is supported through the OP-TEE FDE hooks: the fde-setup
-  hook seals the disk keys in the secure world at install time and the
-  fde-reveal-key inside the initrd unseals them at every boot. This requires the
-  fde_key_handler trusted application to be part of the OP-TEE firmware flashed
-  on the board, which is the case on the Genio EVKs running MediaTek's Ubuntu
-  Core firmware.
-  # TODO: FDE hook to be removed, it is now handled by the snapd implementation
+  Full disk encryption is handled by snapd (2.72 or later) without any FDE hook:
+  snapd seals the disk keys in the secure world at install time and
+  snap-bootstrap unseals them in the initrd at every boot, through the
+  fde_key_handler trusted application. This requires that trusted application to
+  be built into the OP-TEE firmware flashed on the board as an early TA, which is
+  the case on the Genio EVKs running MediaTek's Ubuntu Core firmware.
 
   The MediaTek device trees are shipped under dtbs/: the base board trees plus
   the overlays that come with them (camera, display, audio, APU). Note that 
@@ -42,9 +41,10 @@ description: |
   genio firmware:     https://git.launchpad.net/ubuntu/+source/linux-firmware-mediatek-genio
 
 grade: stable
-# Change to devmode to make FDE hook able to access tee if the snap is not
-# published on the store, with interface auto-connected
 confinement: strict
+
+# FDE relies on snapd's built-in OP-TEE support, which replaced the fde-setup hook
+assumes: [snapd2.72]
 
 license: "GPL-2.0 AND GPL-3.0 AND CC-BY-SA-4.0"
 
@@ -71,17 +71,6 @@ package-repositories:
     suites: [noble]
     key-id: CB4586AF5C6BCD8DF3D48B6856DDEA4936C799E5
     url: https://ppa.launchpadcontent.net/baoshan-team/baoshan-release/ubuntu
-
-# The FDE helper is linked against libteec and libjson-c, which this snap ships
-# in usr/lib and which are nowhere on the library search path of the base snap.
-environment:
-  LD_LIBRARY_PATH: ${SNAP}/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}
-
-# The hook talks to the secure world through /dev/tee0, which is what the tee
-# plug is for.
-hooks:
-  fde-setup:
-    plugs: [tee, home]
 
 parts:
   # Provide the kernel.
@@ -147,7 +136,7 @@ parts:
   # SCSI_UFS_MEDIATEK, USB_XHCI_MTK) plus vfat, ext4 and squashfs into the
   # kernel, so the only module the initrd has to carry is the vfat charset one.
   initrd:
-    after: [firmware, genio-firmware, kernel, signing, optee-uc-fde-client]
+    after: [firmware, genio-firmware, kernel, signing]
     plugin: initrd
     initrd-build-efi-image: true
     initrd-efi-image-key: uki.key
@@ -160,10 +149,6 @@ parts:
       - algif_skcipher
       # vfat mounts of the ESP name this charset
       - nls_iso8859-1
-    initrd-addons:
-      - usr/bin/fde-reveal-key
-      - usr/bin/fde-setup
-      - usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}/libteec.so*
     override-prime: |
       craftctl default
       # snapd looks for kernel.efi on grub-managed systems and kernel.img on
@@ -265,71 +250,6 @@ parts:
     prime:
       - firmware/
       - licenses/
-
-  optee-client:
-    plugin: nil
-    source: https://github.com/OP-TEE/optee_client.git
-    source-type: git
-    source-tag: 4.2.0
-    build-packages:
-      - pkgconf:${CRAFT_ARCH_BUILD_FOR}
-      - uuid-dev:${CRAFT_ARCH_BUILD_FOR}
-    build-environment:
-      - to arm64:
-        - ARCH: "${CRAFT_ARCH_BUILD_FOR}"
-      - CROSS_COMPILE: "${CRAFT_ARCH_TRIPLET_BUILD_FOR}-"
-      - DEBUG: "0"
-      - CFG_TEE_CLIENT_LOAD_PATH: ""
-      - CFG_TA_TEST_PATH: "0"
-      - SBINDIR: "/usr/sbin"
-      - LIBDIR: "/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}"
-      - DESTDIR: "${CRAFT_PART_INSTALL}"
-    override-build: |
-      make O=${CRAFT_PART_BUILD}/out -j$(nproc)
-      make install O=${CRAFT_PART_BUILD}/out
-  
-      mkdir -p "${CRAFT_PART_INSTALL}/addons/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}"
-  
-      cp -f "${CRAFT_PART_INSTALL}/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}/libteec"* \
-            "${CRAFT_PART_INSTALL}/addons/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}"
-    prime:
-      - usr/lib/*/lib*so*
-  
-  optee-uc-fde:
-    plugin: dump
-    source: https://github.com/canonical/optee-uc-fde
-    source-type: git
-    source-branch: master
-    organize:
-      "*": optee-uc-fde/
-    prime:
-      - -*
-  
-  optee-uc-fde-client:
-    after:
-      - optee-client
-      - optee-uc-fde
-    plugin: nil
-    source-type: local
-    build-packages:
-      - libjson-c-dev:${CRAFT_ARCH_BUILD_FOR}
-      - libcryptsetup-dev:${CRAFT_ARCH_BUILD_FOR}
-    build-environment:
-      - ARCH: "${CRAFT_ARCH_BUILD_FOR}"
-      - CROSS_COMPILE: "${CRAFT_ARCH_TRIPLET_BUILD_FOR}-"
-      - OPTEE_CLIENT_EXPORT: "${CRAFT_STAGE}/usr"
-      - DESTDIR: "${CRAFT_PART_INSTALL}"
-    override-build: |
-      make -C ${CRAFT_STAGE}/optee-uc-fde O=${CRAFT_PART_BUILD}/out fde-key-manager fde-reveal-key fde-setup
-      make -C ${CRAFT_STAGE}/optee-uc-fde O=${CRAFT_PART_BUILD}/out fde-key-manager fde-reveal-key fde-setup install
-      install -D -m 755 "${CRAFT_PART_INSTALL}/usr/bin/fde-setup" "${CRAFT_PART_INSTALL}/meta/hooks/fde-setup"
-      install -D -m 755 "${CRAFT_PART_INSTALL}/usr/bin/fde-reveal-key" "${CRAFT_PART_INSTALL}/addons/usr/bin/fde-reveal-key"
-      ln -sf fde-reveal-key "${CRAFT_PART_INSTALL}/addons/usr/bin/fde-setup"
-    stage:
-      - addons/
-      - meta/
-    prime:
-      - meta/
 
   # Key and certificate for signing the UKI
   signing:
