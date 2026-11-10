@@ -56,7 +56,7 @@ platforms:
 # Needed to fetch arm64 packages when cross-building on amd64.
 package-repositories:
   - type: apt
-    architectures: [$CRAFT_ARCH_BUILD_FOR]
+    architectures: [arm64]
     formats: [deb]
     components: [main]
     suites: [noble, noble-updates, noble-security]
@@ -65,7 +65,7 @@ package-repositories:
   # Add temporarily baoshan-release public PPA for linux-firmware-mediatek-genio
   # Waiting for Mali firmware availability in noble archive (multiverse)
   - type: apt
-    architectures: [$CRAFT_ARCH_BUILD_FOR]
+    architectures: [arm64]
     formats: [deb]
     components: [main]
     suites: [noble]
@@ -86,14 +86,17 @@ parts:
     # the same config the linux-mtk debs are built with. The plugin does this by
     # running 'debian/rules clean genconfigs' in the source tree.
     kernel-ubuntu-kconfigflavour: mtk
-    kernel-kconfigs:
-      # Debug info roughly triples the size of the build tree and adds a lot of
-      # build time. Nothing in the snap ships it, so drop it. Remove this line
-      # if you need to build out-of-tree modules with matching debug info.
-      - CONFIG_DEBUG_INFO_NONE=y
+    # Debug info roughly triples the size of the build tree and adds a lot of
+    # build time. To save it, uncomment the following two lines. Note that any
+    # BPF tool relying on /sys/kernel/btf/vmlinux won't work (e.g. bpftrace).
+    # dwarves build-package can also be removed in that case.
+    #kernel-kconfigs:
+    #  - CONFIG_DEBUG_INFO_NONE=y
     build-packages:
-      - on amd64:
-          - crossbuild-essential-arm64
+      - ccache
+      - dwarves
+    build-environment:
+      - PATH: "/usr/lib/ccache:${PATH}"
     override-build: |
       craftctl default
 
@@ -149,13 +152,12 @@ parts:
       - algif_skcipher
       # vfat mounts of the ESP name this charset
       - nls_iso8859-1
-    override-prime: |
-      craftctl default
-      # snapd looks for kernel.efi on grub-managed systems and kernel.img on
-      # u-boot-managed ones.
-      mv "${CRAFT_PRIME}/kernel.efi" "${CRAFT_PRIME}/kernel.img"
+    # snapd looks for kernel.efi on grub-managed systems and kernel.img on
+    # u-boot-managed ones.
+    organize:
+      kernel.efi: kernel.img
     prime:
-      - kernel.efi
+      - kernel.img
       - snapd-info
       - manifest-initramfs.yaml*
 
@@ -172,12 +174,35 @@ parts:
       - linux-firmware
       - wireless-regdb
     organize:
-      # On Ubuntu Core, the firmware directory is expected to be at the
-      # top-level. However, the kernel assumes firmware is in lib/firmware/. The
-      # kernel plugin will create the appropriate symlink for us.
       lib/firmware: firmware/
     override-build: |
       craftctl default
+
+      fw="${CRAFT_PART_INSTALL}/lib/firmware"
+      # The MediaTek co-processor firmware and the SOF audio files are declared
+      # by no module, so move them out of the way and back after the trim.
+      keep="${CRAFT_PART_INSTALL}/.firmware-keep"
+      rm -rf "${keep}"
+      mkdir "${keep}"
+      for d in "${fw}"/mediatek/mt8* "${fw}"/mediatek/sof "${fw}"/mediatek/sof-tplg; do
+        [ -e "${d}" ] || continue
+        mv "${d}" "${keep}/"
+      done
+
+      # TODO: once trim-firmware accepts the modules directory as a second
+      # argument, drop the cp -al/rm and call it with "${CRAFT_STAGE}" instead.
+      cp -al "${CRAFT_STAGE}/modules" "${CRAFT_PART_INSTALL}/lib/modules"
+      "${CRAFT_PART_SRC}/trim-firmware" "${CRAFT_PART_INSTALL}/lib"
+      rm -rf "${CRAFT_PART_INSTALL:?}/lib/modules"
+
+      # Restore MediaTek related firmwares
+      mkdir -p "${fw}/mediatek"
+      for d in "${keep}"/*; do
+        [ -e "${d}" ] || continue
+        rm -rf "${fw}/mediatek/${d##*/}"
+        mv "${d}" "${fw}/mediatek/"
+      done
+      rmdir "${keep}"
 
       # A license file for every package unpacked above, named after it.
       # DEP-5 copyright files are self-contained: they list which blobs each
@@ -197,31 +222,7 @@ parts:
              "their license texts" >&2
         exit 1
       }
-
-    override-prime: |
-      craftctl default
-
-      "${CRAFT_STAGE}/trim-firmware" "${CRAFT_PRIME}"
-
-      # trim-firmware keeps only the firmware declared in module metadata. The
-      # MediaTek co-processor firmware and the SOF audio files are declared by no
-      # module, so put them back after the trim -- from this part's own install
-      # directory, which now holds only linux-firmware and wireless-regdb.
-      mkdir -p "${CRAFT_PRIME}/firmware/mediatek"
-      for fw in "${CRAFT_PART_INSTALL}"/firmware/mediatek/mt8* \
-                "${CRAFT_PART_INSTALL}"/firmware/mediatek/sof \
-                "${CRAFT_PART_INSTALL}"/firmware/mediatek/sof-tplg; do
-        [ -d "${fw}" ] || continue
-        cp -a "${fw}" "${CRAFT_PRIME}/firmware/mediatek/"
-      done
-
-      # Create a mountpoint for firmware updates (LP: #2051144)
-      install -d "${CRAFT_PRIME}/firmware/updates"
     stage:
-      - firmware/
-      - licenses/
-      - trim-firmware
-    prime:
       - firmware/
       - licenses/
 
@@ -245,9 +246,6 @@ parts:
       install -Dm 644 "${doc}" \
         "${CRAFT_PART_INSTALL}/licenses/copyright.linux-firmware-mediatek-genio"
     stage:
-      - firmware/
-      - licenses/
-    prime:
       - firmware/
       - licenses/
 
